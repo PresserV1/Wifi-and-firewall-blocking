@@ -1,0 +1,312 @@
+"""
+net_control_ui.py
+
+Windows-only Python GUI to:
+ - Disable/Enable Wi-Fi adapter(s)
+ - Block inbound & outbound via Windows Firewall (saves previous settings)
+ - Restore firewall settings
+
+Requires: Python 3.8+, run as Administrator.
+
+Author: (PresserV1)
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import ctypes
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+# --- Admin helpers ----------------------------------------------------------------
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+def run_as_admin():
+    """Relaunch the current script as admin (UAC)."""
+    python_exe = sys.executable
+    script = os.path.abspath(sys.argv[0])
+    params = " ".join([f'"{arg}"' for arg in sys.argv[1:]])
+    # ShellExecuteW return >32 on success
+    try:
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", python_exe, f'"{script}" {params}', None, 1)
+        return ret > 32
+    except Exception as e:
+        print("Failed to elevate:", e)
+        return False
+
+# --- PowerShell helper ------------------------------------------------------------
+def run_powershell(cmd, capture_output=True):
+    """Run a PowerShell command and return stdout (decoded). Raises subprocess.CalledProcessError on failure."""
+    # Use -NoProfile -NonInteractive for stability
+    ps_cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd]
+    res = subprocess.run(ps_cmd, capture_output=capture_output, text=True, shell=False)
+    if res.returncode != 0:
+        raise subprocess.CalledProcessError(res.returncode, ps_cmd, output=res.stdout, stderr=res.stderr)
+    return res.stdout.strip()
+
+# --- Network adapter helpers ------------------------------------------------------
+def list_wifi_adapters():
+    """Return list of adapter names likely representing Wi-Fi/wireless (Name strings)."""
+    try:
+        json_out = run_powershell("Get-NetAdapter | Select-Object -Property Name,InterfaceDescription,Status | ConvertTo-Json -Depth 2")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError("Failed to query network adapters. Run as Administrator.") from e
+
+    if not json_out:
+        return []
+
+    # PowerShell returns either a single object or a list
+    try:
+        data = json.loads(json_out)
+    except json.JSONDecodeError:
+        return []
+
+    adapters = []
+    if isinstance(data, dict):
+        data = [data]
+
+    for item in data:
+        name = item.get("Name", "") or ""
+        desc = item.get("InterfaceDescription", "") or ""
+        status = item.get("Status", "") or ""
+        # Heuristic: look for wifi/wireless/wi in name or description
+        low = (name + " " + desc).lower()
+        if "wi" in low and ("wifi" in low or "wireless" in low or "wlan" in low or "wi-fi" in low):
+            adapters.append({"Name": name, "Description": desc, "Status": status})
+    # Fallback: if none matched, offer any adapter that is 'Up' and has 'Wireless' or 'Wi-Fi' in desc
+    if not adapters:
+        # include adapters whose description contains wireless/wifi
+        for item in (data if isinstance(data, list) else []):
+            name = item.get("Name", "")
+            desc = item.get("InterfaceDescription", "")
+            status = item.get("Status", "")
+            if desc and ("wireless" in desc.lower() or "wifi" in desc.lower() or "wi-fi" in desc.lower() or "wlan" in desc.lower()):
+                adapters.append({"Name": name, "Description": desc, "Status": status})
+    # If still none, return an empty list (UI will show available adapters if user wants a full list)
+    return adapters
+
+def disable_adapter(name):
+    cmd = f'Disable-NetAdapter -Name "{name}" -Confirm:$false'
+    return run_powershell(cmd)
+
+def enable_adapter(name):
+    cmd = f'Enable-NetAdapter -Name "{name}" -Confirm:$false'
+    return run_powershell(cmd)
+
+# --- Firewall helpers -------------------------------------------------------------
+FIREWALL_BACKUP_FILE = os.path.join(tempfile.gettempdir(), "firewall_profile_backup.json")
+
+def backup_firewall_profiles():
+    """Save current firewall profile DefaultInboundAction/DefaultOutboundAction to temp file."""
+    cmd = "Get-NetFirewallProfile | Select-Object -Property Name,DefaultInboundAction,DefaultOutboundAction | ConvertTo-Json -Depth 2"
+    out = run_powershell(cmd)
+    if not out:
+        raise RuntimeError("No firewall profile info returned.")
+    with open(FIREWALL_BACKUP_FILE, "w", encoding="utf-8") as f:
+        f.write(out)
+    return FIREWALL_BACKUP_FILE
+
+def block_inbound_outbound():
+    """
+    Set DefaultInboundAction and DefaultOutboundAction to Block for all profiles.
+    Save previous settings to a backup file.
+    """
+    backup_firewall_profiles()
+    # Apply Block for inbound/outbound across all profiles
+    cmd = 'Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultInboundAction Block -DefaultOutboundAction Block'
+    return run_powershell(cmd)
+
+def restore_firewall_profiles():
+    """Restore firewall profiles from backup file saved earlier."""
+    if not os.path.exists(FIREWALL_BACKUP_FILE):
+        raise RuntimeError("No firewall backup found. Cannot restore.")
+    with open(FIREWALL_BACKUP_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # data may be list or single object
+    items = data if isinstance(data, list) else [data]
+    results = []
+    for item in items:
+        name = item.get("Name")
+        inbound = item.get("DefaultInboundAction")
+        outbound = item.get("DefaultOutboundAction")
+        if not name:
+            continue
+        # Build Set-NetFirewallProfile for this profile name
+        cmd = f'Set-NetFirewallProfile -Profile {name} -DefaultInboundAction {inbound} -DefaultOutboundAction {outbound}'
+        results.append(run_powershell(cmd))
+    # Optionally remove backup after successful restore
+    try:
+        os.remove(FIREWALL_BACKUP_FILE)
+    except Exception:
+        pass
+    return results
+
+# --- UI ---------------------------------------------------------------------------
+class NetControlApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Network Control Utility (Windows)")
+        self.geometry("560x360")
+        self.resizable(False, False)
+        self.style = ttk.Style(self)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        # Adapter selection
+        ttk.Label(frame, text="Wi-Fi Adapter:").grid(column=0, row=0, sticky="w")
+        self.adapter_var = tk.StringVar()
+        self.adapter_combo = ttk.Combobox(frame, textvariable=self.adapter_var, width=50, state="readonly")
+        self.adapter_combo.grid(column=0, row=1, columnspan=3, sticky="w", pady=(2,8))
+        ttk.Button(frame, text="Refresh Adapter List", command=self.refresh_adapters).grid(column=3, row=1, sticky="e", padx=(8,0))
+
+        # Adapter status label
+        self.status_label = ttk.Label(frame, text="Status: unknown")
+        self.status_label.grid(column=0, row=2, columnspan=3, sticky="w", pady=(0,10))
+
+        # Adapter controls
+        ttk.Button(frame, text="Disable Wi-Fi", command=self.on_disable_adapter).grid(column=0, row=3, sticky="w", pady=(4,4))
+        ttk.Button(frame, text="Enable Wi-Fi", command=self.on_enable_adapter).grid(column=1, row=3, sticky="w", pady=(4,4))
+        ttk.Button(frame, text="List All Adapters (console)", command=self.list_all_adapters_console).grid(column=2, row=3, columnspan=2, sticky="w", pady=(4,4))
+
+        # Firewall controls
+        sep = ttk.Separator(frame, orient="horizontal")
+        sep.grid(column=0, row=4, columnspan=4, sticky="ew", pady=(12,12))
+
+        ttk.Label(frame, text="Windows Firewall (profiles):").grid(column=0, row=5, sticky="w")
+        ttk.Button(frame, text="Block Inbound + Outbound (save current)", command=self.on_block_firewall).grid(column=0, row=6, sticky="w", pady=(6,6))
+        ttk.Button(frame, text="Restore Firewall (from backup)", command=self.on_restore_firewall).grid(column=1, row=6, sticky="w", pady=(6,6))
+        self.fw_status_label = ttk.Label(frame, text="Firewall backup: {}".format("exists" if os.path.exists(FIREWALL_BACKUP_FILE) else "not found"))
+        self.fw_status_label.grid(column=0, row=7, columnspan=3, sticky="w", pady=(8,0))
+
+        # Footer / warnings
+        warning = ("⚠ Requires Administrator. Blocking outbound traffic can break connectivity.\n"
+                   "Backup file location: {}".format(FIREWALL_BACKUP_FILE))
+        ttk.Label(frame, text=warning, foreground="darkred", wraplength=520).grid(column=0, row=8, columnspan=4, sticky="w", pady=(12,0))
+
+        self.refresh_adapters()
+
+    def refresh_adapters(self):
+        try:
+            adapters = list_wifi_adapters()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to list adapters:\n{e}")
+            adapters = []
+        items = []
+        for a in adapters:
+            items.append(f'{a["Name"]}  ({a["Status"]})')
+        # If no auto matches found, show all adapters (Get-NetAdapter)
+        if not items:
+            try:
+                all_json = run_powershell("Get-NetAdapter | Select-Object -Property Name,InterfaceDescription,Status | ConvertTo-Json -Depth 2")
+                parsed = json.loads(all_json) if all_json else []
+                if isinstance(parsed, dict):
+                    parsed = [parsed]
+                items = [f'{p.get("Name","")}  ({p.get("Status","")})' for p in parsed]
+            except Exception:
+                items = []
+        self.adapter_combo["values"] = items
+        if items:
+            self.adapter_combo.current(0)
+            self.status_label.config(text=f"Status: {items[0]}")
+        else:
+            self.adapter_combo.set("")
+            self.status_label.config(text="Status: no adapters found")
+
+        self.fw_status_label.config(text="Firewall backup: {}".format("exists" if os.path.exists(FIREWALL_BACKUP_FILE) else "not found"))
+
+    def get_selected_adapter_name(self):
+        val = self.adapter_var.get()
+        if not val:
+            return None
+        # combobox items are "Name  (Status)"; extract name before double spaces
+        name = val.split("  ")[0].strip()
+        return name
+
+    def on_disable_adapter(self):
+        name = self.get_selected_adapter_name()
+        if not name:
+            messagebox.showwarning("No adapter", "Please select an adapter first.")
+            return
+        if not messagebox.askyesno("Confirm", f"Disable adapter '{name}'? This will disconnect Wi-Fi."):
+            return
+        try:
+            out = disable_adapter(name)
+            messagebox.showinfo("Success", f"Adapter '{name}' disabled.")
+            self.refresh_adapters()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to disable adapter:\n{e}")
+
+    def on_enable_adapter(self):
+        name = self.get_selected_adapter_name()
+        if not name:
+            messagebox.showwarning("No adapter", "Please select an adapter first.")
+            return
+        try:
+            out = enable_adapter(name)
+            messagebox.showinfo("Success", f"Adapter '{name}' enabled.")
+            self.refresh_adapters()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to enable adapter:\n{e}")
+
+    def on_block_firewall(self):
+        if not messagebox.askyesno("Confirm", "This will set the Windows firewall DefaultInboundAction and DefaultOutboundAction to BLOCK for all profiles.\n\nProceed?"):
+            return
+        try:
+            backup_firewall_profiles()
+            block_inbound_outbound()
+            messagebox.showinfo("Success", "Firewall profiles set to block inbound and outbound. Previous settings backed up.")
+            self.fw_status_label.config(text="Firewall backup: exists")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to change firewall:\n{e}")
+
+    def on_restore_firewall(self):
+        if not os.path.exists(FIREWALL_BACKUP_FILE):
+            messagebox.showwarning("No backup", "No firewall backup found to restore.")
+            return
+        if not messagebox.askyesno("Confirm", "Restore firewall settings from the previously saved backup?"):
+            return
+        try:
+            restore_firewall_profiles()
+            messagebox.showinfo("Success", "Firewall settings restored from backup.")
+            self.fw_status_label.config(text="Firewall backup: not found")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to restore firewall:\n{e}")
+
+    def list_all_adapters_console(self):
+        # show full adapter list in a dialog (or console)
+        try:
+            out = run_powershell("Get-NetAdapter | Select-Object -Property Name,InterfaceDescription,Status | ConvertTo-Json -Depth 2")
+            # pretty show
+            messagebox.showinfo("Adapters (JSON)", out if out else "No output")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to list adapters:\n{e}")
+
+# --- Main -------------------------------------------------------------------------
+def main():
+    if os.name != "nt":
+        messagebox.showerror("Not supported", "This program is Windows-only.")
+        return
+
+    if not is_admin():
+        # Try to relaunch as admin
+        if messagebox.askyesno("Administrator required", "This program needs to run as Administrator. Relaunch as admin now?"):
+            ok = run_as_admin()
+            if not ok:
+                messagebox.showerror("Elevation failed", "Failed to relaunch as Administrator.")
+            sys.exit(0)
+        else:
+            messagebox.showwarning("Not running", "You chose not to run as Administrator. Exiting.")
+            sys.exit(0)
+
+    app = NetControlApp()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
