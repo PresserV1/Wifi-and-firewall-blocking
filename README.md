@@ -1,15 +1,11 @@
 # Wifi-and-firewall-blocking
 Basically just made it to use when pirating games saves me time instead of manually having to turn off Wi-Fi and setting inbounding and out bounding rules i can use this since its more efficient.
 
-Important safety & permission notes (read first)
-
-This script is for Windows only (uses PowerShell/NetAdapter/NetFirewall).
-
-It requires Administrator privileges. The script will try to relaunch itself as admin if not started that way.
-
-Blocking outbound traffic will prevent internet access for apps. Use with caution. I provide a “backup/restore” for firewall defaults so you can return to the previous state.
-
-Don’t run this on other people’s machines without explicit permission.
+|Important safety & permission notes (read first)|
+- This script is for Windows only (uses PowerShell/NetAdapter/NetFirewall).
+- It requires Administrator privileges. The script will try to relaunch itself as admin if not started that way.
+- Blocking outbound traffic will prevent internet access for apps. Use with caution. I provide a “backup/restore” for firewall defaults so you can return to the previous state.
+- Don’t run this on other people’s machines without explicit permission.
 
 
 How to use
